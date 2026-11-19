@@ -1,0 +1,127 @@
+// Tilt platform manual control: the analog joystick position is mapped
+// directly to servo angle (proportional control), not stepped/sequenced.
+// Pressing the joystick button recenters both axes.
+//
+// Calibration: on boot, the joystick's current (resting) reading is sampled
+// and used as the center reference, instead of assuming the ADC midpoint —
+// analog joysticks rarely rest exactly at the mathematical center. Don't
+// touch the stick while the board is powering on/resetting.
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+// Servo pin assignment — must match the wiring in README.md
+constexpr int PAN_PIN = 12;
+constexpr int TILT_PIN = 13;
+
+// Joystick pin assignment — must match the wiring in README.md
+constexpr int JOYSTICK_X_PIN = 34;   // VRx -> pan
+constexpr int JOYSTICK_Y_PIN = 35;   // VRy -> tilt
+constexpr int JOYSTICK_SW_PIN = 25;  // button -> recenter
+
+// Conservative default clear of most mounts' hard stops — narrow further
+// once you've confirmed the exact range your bracket can clear without straining.
+constexpr int ANGLE_MIN = 30;
+constexpr int ANGLE_MAX = 150;
+constexpr int CENTER_ANGLE = 90;
+constexpr int ADC_MAX = 4095;  // ESP32 ADC resolution (12-bit)
+
+constexpr unsigned long UPDATE_INTERVAL_MS = 5;  // matches the servo's own ~50Hz update rate
+constexpr int DEADZONE_RAW = 180;  // ignore small noise/drift around the calibrated center
+constexpr int OVERSAMPLE_COUNT = 16;  // averaged per reading to reduce ADC/electrical noise
+constexpr int MAX_STEP_DEGREES = 1;  // slew limit per tick — eases toward the target instead of jumping
+
+int readAveraged(int pin) {
+  long total = 0;
+  for (int i = 0; i < OVERSAMPLE_COUNT; i++) {
+    total += analogRead(pin);
+  }
+  return total / OVERSAMPLE_COUNT;
+}
+
+Servo panServo;
+Servo tiltServo;
+
+unsigned long lastUpdateMs = 0;
+int panCenterRaw = ADC_MAX / 2;
+int tiltCenterRaw = ADC_MAX / 2;
+int panAngle = CENTER_ANGLE;
+int tiltAngle = CENTER_ANGLE;
+
+// Maps raw around a calibrated center instead of the ADC midpoint, so the
+// full ANGLE_MIN..ANGLE_MAX range is preserved even if center isn't ADC_MAX/2.
+// A deadzone around center absorbs small ADC noise so the servo holds still
+// when the stick is released.
+int angleFromRaw(int raw, int centerRaw) {
+  if (raw < centerRaw - DEADZONE_RAW) {
+    return map(raw, 0, centerRaw - DEADZONE_RAW, ANGLE_MIN, CENTER_ANGLE);
+  }
+  if (raw > centerRaw + DEADZONE_RAW) {
+    return map(raw, centerRaw + DEADZONE_RAW, ADC_MAX, CENTER_ANGLE, ANGLE_MAX);
+  }
+  return CENTER_ANGLE;
+}
+
+// Moves at most MAX_STEP_DEGREES toward target instead of jumping straight
+// to it — makes motion smoother/slower and filters out brief noise spikes.
+int stepToward(int current, int target, int maxStep) {
+  if (target > current) {
+    return min(current + maxStep, target);
+  }
+  if (target < current) {
+    return max(current - maxStep, target);
+  }
+  return current;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(JOYSTICK_SW_PIN, INPUT_PULLUP);
+
+  // Allow allocation of all timers so both servos can run independently
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+
+  panServo.setPeriodHertz(50);
+  tiltServo.setPeriodHertz(50);
+  panServo.attach(PAN_PIN, 500, 2400);
+  tiltServo.attach(TILT_PIN, 500, 2400);
+
+  panCenterRaw = readAveraged(JOYSTICK_X_PIN);
+  tiltCenterRaw = readAveraged(JOYSTICK_Y_PIN);
+  Serial.printf("calibrated center — pan raw: %d  tilt raw: %d\n", panCenterRaw, tiltCenterRaw);
+
+  // No forced write here — the horns are already mechanically centered, so
+  // the first loop() tick sets the position from the real joystick reading
+  // instead of snapping to a hardcoded angle first.
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastUpdateMs < UPDATE_INTERVAL_MS) {
+    return;
+  }
+  lastUpdateMs = now;
+
+  if (digitalRead(JOYSTICK_SW_PIN) == LOW) {
+    panAngle = CENTER_ANGLE;
+    tiltAngle = CENTER_ANGLE;
+    panServo.write(panAngle);
+    tiltServo.write(tiltAngle);
+    Serial.println("recentered");
+    return;
+  }
+
+  int panRaw = readAveraged(JOYSTICK_X_PIN);
+  int tiltRaw = readAveraged(JOYSTICK_Y_PIN);
+  int panTarget = angleFromRaw(panRaw, panCenterRaw);
+  int tiltTarget = angleFromRaw(tiltRaw, tiltCenterRaw);
+
+  panAngle = stepToward(panAngle, panTarget, MAX_STEP_DEGREES);
+  tiltAngle = stepToward(tiltAngle, tiltTarget, MAX_STEP_DEGREES);
+
+  panServo.write(panAngle);
+  tiltServo.write(tiltAngle);
+
+  Serial.printf("pan raw: %d angle: %d  |  tilt raw: %d angle: %d\n", panRaw, panAngle, tiltRaw, tiltAngle);
+}
